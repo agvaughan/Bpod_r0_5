@@ -17,7 +17,8 @@ See the GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 %}
-function Olfactory2AFC
+function Olfactory2AFC_NIDAQ
+
 % This protocol demonstrates control of the Island Motion olfactometer by using the hardware serial port to control an Arduino Leonardo Ethernet client.
 % Written by Josh Sanders, 10/2014.
 %
@@ -37,9 +38,10 @@ S = BpodSystem.ProtocolSettings; % Load settings chosen in launch manager into c
 if isempty(fieldnames(S))  % If settings file was an empty struct, populate struct with default settings
     S.GUI.RewardAmount = 5;
     S.GUI.StimulusDelayDuration = 0;
-    S.GUI.MaxOdorDuration = 1;
-    S.GUI.TimeForResponse = 5;
-    S.GUI.TimeoutDuration = 2;
+    S.GUI.MaxOdorDuration   = 1;
+    S.GUI.TimeForResponse   = 5;
+    S.GUI.TimeoutDuration   = 2;
+    S.GUI.PostTrialDuration = 1;
 end
 
 % Initialize parameter GUI plugin
@@ -57,7 +59,7 @@ OutcomePlot(BpodSystem.GUIHandles.OutcomePlot,'init',2-TrialTypes);
 BpodNotebook('init');
 
 %% Initialize Ethernet client on hardware serial port 1 and connect to olfactometer
-SerialEthernet('Init', 'COM65'); % Set this to the correct COM port for Arduino Leonardo
+SerialEthernet('Init', 'COM5'); % Set this to the correct COM port for Arduino Leonardo
 pause(1);
 OlfIP = [192 168 0 104];
 SerialEthernet('Connect', OlfIP, 3336);
@@ -99,52 +101,56 @@ and then will just align things appropriately using Bpod triggers in the
 Trigger Channel.
     
 %}
-
+%%
 % Define parameters for analog inputs.  Some params not used for manual trigger.
 ai.duration                 = 11;        % 10 second acquisition
 ai.sample_rate              = 10000;     % 10khz aquisition
 ai.channels                 = 1:4;       % 4 channels - do not 
 ai.trigger_type             = 'manual';  % Manual trigger [ie., start(ai.AI)]
-ai.TriggerDelay             = -1 * ai.sample_rate; % Pre-trigger sampling for 1s
-ai.TriggerDelayUnits        = 'samples'; % Pre-trigger sampling for 1s
-%ai.trigger_channel          = channels(4);        % Hardware trigger onchannel 4
-%ai.trigger_condition        = 'Rising'; % 10 second acquisition
-%ai.trigger_condition_value  = 0.2;      % Trigger value.
 
 % Define parameters for analog outputs
 ao.duration                 = ai.duration*1.1; % Same as input, with a hedge.
-ao.channels                 = 1;           % 1 channel (for laser)
+ao.channels                 = 0;           % 1 channel (for laser)
 ao.sample_rate              = 10000;       % 10 second acquisition
 ao.trigger_type             = 'Manual';
 %ao.trigger_channel          = 4;
 %ao.trigger_condition        = 'Rising';    % 10 second acquisition
 
+%% Set up DAQ object
+% The architecture here is that we initialize a DAQ input object with the
+% following channels:
+% Ai0  :: (+- amplified) input from the photometer.
+% Ai4  :: Rotary encoder from the wheel,.
+% Ai5  :: 
+% Pfl1 :: trigger
+%
+% The laser will be stimulated from the bpod itself, via BNC-1 or BNC-2 
+% turned on/off  via states WaitForCenterPoke/PostTrialPeriod. Both BNCs
+% are used, so one can be used to trigger the DAQ and one used to drive the
+% laser. Note that the BNC triggers are 2-bytes, so 
+%0 = OFF, 1 = BNC1 ON, 2 = BNC2 ON, 3 = BNC1 ON & BNC2 ON
+% 
+% The input trigger is set to PFI1/TRIG2 (ie., channel 10 with 9 reference
+% on the SCB-68 on this rig)
 
+s = daq.createSession('ni')
+addAnalogInputChannel(s,'Dev1','ai0', 'Voltage');
+addTriggerConnection(s,'external','Dev1/PFI1','StartTrigger')
+startForeground(s)
+
+%%
 % Initialize analoginput
-ai.AI = analoginput('nidaq','dev1');
-ai.channels = addchannel(ai.AI,ai.channels);
-set(ai.AI,'TriggerChannel',ai.trigger_channel)
-set(ai.AI,'SampleRate',ai.sample_rate )
-set(ai.AI,'TriggerType',ai.trigger_type)
-if strcmp(ai.trigger_type,'Software')
-    set(ai.AI,'TriggerCondition','Rising')
-    set(ai.AI,'TriggerConditionValue',ai.trigger_condition_value)
-end
-ai.ActualRate = get(ai.AI,'SampleRate');
-set(ai.AI,'SamplesPerTrigger',ai.duration*ai.ActualRate)
+DAQ = daq.createSession('ni');
+DAQ.addAnalogInputChannel('Dev1',ai.channels,'Voltage');
+DAQ.Rate = ai.sample_rate;
+DAQ.DurationInSeconds = ai.duration;
+% Initialize Trigger
+DAQ.TriggersPerRun = Inf;
+DAQ.ExternalTriggerTimeout = 500;
+DAQ
 
-% Initialize analogoutput
-ao.AO = analogoutput('nidaq','dev1');
-ao.channels = addchannel(AO,ao.channels);
-set(ao.AO,'SampleRate',ao.sample_rate)
-ao.ActualRate = get(ao.AO,'SampleRate');
-set(ao.AO,'TriggerType',ao.trigger_tpe)
-ao.data = ones(ao.ActualRate*ao.duration) * 5;
-putdata(ao.AO,ao.data);
+DAQ.startBackground()
 
-% Start ai.AI and ao.AO
-start(ai.AI)
-start(ao.AO)
 
 %% Main trial loop
 try,
@@ -170,7 +176,7 @@ try,
         sma = AddState(sma, 'Name', 'WaitForCenterPoke', ...
             'Timer', 0,...
             'StateChangeConditions', {'Port2In', 'Delay'},...
-            'OutputActions', {'BNCState', 1});
+            'OutputActions', {'BNCState', 3});
         sma = AddState(sma, 'Name', 'Delay', ...
             'Timer', S.GUI.StimulusDelayDuration,...
             'StateChangeConditions', {'Tup', 'DeliverStimulus'},...
@@ -185,29 +191,28 @@ try,
             'OutputActions', {'Serial1Code', 2, 'PWM1', 255, 'PWM3', 255});
         sma = AddState(sma, 'Name', 'Reward', ...
             'Timer', ValveTime,...
-            'StateChangeConditions', {'Tup', 'exit'},...
+            'StateChangeConditions', {'Tup', 'PostTrialPeriod'},...
             'OutputActions', {'ValveState', ValveCode});
         sma = AddState(sma, 'Name', 'Punish', ...
             'Timer', S.GUI.TimeoutDuration,...
-            'StateChangeConditions', {'Tup', 'exit'},...
+            'StateChangeConditions', {'Tup', 'PostTrialPeriod'},...
             'OutputActions', {});
         sma = AddState(sma, 'Name', 'EarlyWithdrawalPunish', ...
             'Timer', S.GUI.TimeoutDuration,...
-            'StateChangeConditions', {'Tup', 'exit'},...
+            'StateChangeConditions', {'Tup', 'PostTrialPeriod'},...
             'OutputActions', {});
+        sma = AddState(sma,'Name','PostTrialPeriod', ...
+            'Timer', S.GUI.PostTrialDuration,...
+            'StateChangeConditions',{'Tup','exit'},...
+            'OutputActions', {'BNCState', 3});
+        
         SendStateMatrix(sma);
         
-        % Prep NIDAQ
-        % TODO :: Clear ai.AI? data?
-        putdata(ao.AO,ao.data);
-        trigger(AO)
-        trigger(AI)
         
         % Run state matrix
         RawEvents = RunStateMatrix();
         
         % Recover AI data and cleaup AI/AO.
-        stop(ai.AI)
         ai.data = getdata(ai.AI);
         stop(ao.AO)
 
